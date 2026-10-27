@@ -9,3 +9,9 @@
 .cxx
 app/build
 app/.cxx
+*.apk
+*.aab
+*.ap_
+*.dex
+*.keystore
+*.jks

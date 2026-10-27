@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="1560"
+    android:viewportHeight="1560">
+    <!-- Centered 1000x1000 SVG canvas inside 108dp Adaptive Icon safe zone -->
+    <group
+        android:translateX="280"
+        android:translateY="280">
+        <!-- カーブ線（白） -->
+        <path
+            android:pathData="M 30,960 A 930,930 0 0,0 960,30"
+            android:strokeWidth="26"
+            android:strokeColor="#FFFFFF"
+            android:strokeLineCap="round" />
+
+        <!-- カーブ中央の丸い点 (cx=688, cy=688, r=40) -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M 688,688 m -40,0 a 40,40 0 1,0 80,0 a 40,40 0 1,0 -80,0" />
+    </group>
+</vector>

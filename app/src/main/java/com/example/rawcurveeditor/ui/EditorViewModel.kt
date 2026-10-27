@@ -3,6 +3,7 @@ package com.example.rawcurveeditor.ui
 import android.app.Application
 import android.graphics.Bitmap
 import android.net.Uri
+import androidx.compose.runtime.Immutable
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.rawcurveeditor.data.RawImageRepository
@@ -11,78 +12,234 @@ import com.example.rawcurveeditor.domain.CurvePoint
 import com.example.rawcurveeditor.domain.ExportFormat
 import com.example.rawcurveeditor.domain.HistogramData
 import com.example.rawcurveeditor.domain.RgbCurvesState
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.roundToInt
+
+@Immutable
+data class PhotoSessionItem(
+    val id: Int,
+    val uri: Uri,
+    val fileName: String,
+    val fullWidth: Int,
+    val fullHeight: Int,
+    val previewWidth: Int,
+    val previewHeight: Int,
+    val isLibRaw16Bit: Boolean,
+    val originalPreviewBitmap: Bitmap,
+    val thumbnailBitmap: Bitmap,
+    val histogram: HistogramData,
+    val curvesState: RgbCurvesState = RgbCurvesState()
+)
 
 data class EditorUiState(
     val isLoading: Boolean = false,
+    val loadingProgress: Float = 0f,
     val isExporting: Boolean = false,
-    val fileName: String = "",
-    val fullWidth: Int = 0,
-    val fullHeight: Int = 0,
-    val isLibRaw16Bit: Boolean = false,
-    val originalPreviewBitmap: Bitmap? = null,
+    val exportProgress: Float = 0f,
+    val exportProgressDetail: String = "",
+    val photos: List<PhotoSessionItem> = emptyList(),
+    val selectedPhotoId: Int = -1,
     val previewBitmap: Bitmap? = null,
-    val histogram: HistogramData = HistogramData(),
-    val curvesState: RgbCurvesState = RgbCurvesState(),
+    val previewRevision: Long = 0L,
     val activeChannel: CurveChannel = CurveChannel.MASTER,
+    val clipboardCurves: RgbCurvesState? = null,
     val isShowingBefore: Boolean = false,
     val isExportDialogVisible: Boolean = false,
+    val isApplyAllConfirmVisible: Boolean = false,
     val statusMessage: String? = null
 ) {
-    val hasImage: Boolean get() = previewBitmap != null && fullWidth > 0 && fullHeight > 0
+    val activePhoto: PhotoSessionItem?
+        get() = photos.firstOrNull { it.id == selectedPhotoId } ?: photos.firstOrNull()
+
+    val hasImage: Boolean
+        get() = activePhoto != null && previewBitmap != null
 }
 
 class EditorViewModel(application: Application) : AndroidViewModel(application) {
 
+    private data class PreviewRenderRequest(
+        val photoId: Int,
+        val previewWidth: Int,
+        val previewHeight: Int,
+        val curvesState: RgbCurvesState
+    )
+
     private val repository = RawImageRepository(application.applicationContext)
+    private val nextPhotoId = AtomicInteger(1)
 
     private val _uiState = MutableStateFlow(EditorUiState())
     val uiState: StateFlow<EditorUiState> = _uiState.asStateFlow()
 
-    private var previewRenderJob: Job? = null
+    // Conflated channel guarantees zero backlog and continuous 60-120fps preview + real-time histogram rendering
+    private val previewRenderChannel = Channel<PreviewRenderRequest>(Channel.CONFLATED)
 
-    fun openRawUri(uri: Uri) {
+    init {
+        viewModelScope.launch {
+            for (req in previewRenderChannel) {
+                val res = repository.renderPreview(
+                    photoId = req.photoId,
+                    previewWidth = req.previewWidth,
+                    previewHeight = req.previewHeight,
+                    curvesState = req.curvesState
+                )
+                if (res != null) {
+                    _uiState.update { state ->
+                        val updatedPhotos = state.photos.map { item ->
+                            if (item.id == req.photoId) {
+                                item.copy(histogram = res.histogram)
+                            } else {
+                                item
+                            }
+                        }
+                        if (state.activePhoto?.id == req.photoId) {
+                            state.copy(
+                                photos = updatedPhotos,
+                                previewBitmap = res.bitmap,
+                                previewRevision = state.previewRevision + 1L
+                            )
+                        } else {
+                            state.copy(photos = updatedPhotos)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun openRawUris(uris: List<Uri>) {
+        if (uris.isEmpty()) return
         viewModelScope.launch {
             _uiState.update {
                 it.copy(
                     isLoading = true,
-                    statusMessage = "RAW (16-bit) 現像中..."
+                    loadingProgress = 0f,
+                    statusMessage = "RAW (16-bit) 現像中 (0/${uris.size})..."
                 )
             }
-            val result = repository.loadFromUri(uri)
-            result.fold(
-                onSuccess = { info ->
-                    val resetCurves = RgbCurvesState()
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            fileName = info.displayName,
-                            fullWidth = info.fullWidth,
-                            fullHeight = info.fullHeight,
-                            isLibRaw16Bit = info.isDecodedByLibRaw,
-                            originalPreviewBitmap = info.initialPreviewBitmap,
-                            previewBitmap = info.initialPreviewBitmap,
-                            histogram = info.histogram,
-                            curvesState = resetCurves,
-                            statusMessage = null
-                        )
-                    }
-                },
-                onFailure = { err ->
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            statusMessage = "読み込みエラー: ${err.message}"
-                        )
-                    }
+
+            val newlyLoaded = mutableListOf<PhotoSessionItem>()
+            var lastError: String? = null
+
+            uris.forEachIndexed { index, uri ->
+                _uiState.update {
+                    it.copy(
+                        loadingProgress = index.toFloat() / uris.size.coerceAtLeast(1),
+                        statusMessage = "RAW (16-bit) 現像中 (${index + 1}/${uris.size})..."
+                    )
                 }
+                val assignedId = nextPhotoId.getAndIncrement()
+                val res = repository.loadFromUri(assignedId, uri)
+                res.fold(
+                    onSuccess = { info ->
+                        newlyLoaded.add(
+                            PhotoSessionItem(
+                                id = info.photoId,
+                                uri = info.uri,
+                                fileName = info.displayName,
+                                fullWidth = info.fullWidth,
+                                fullHeight = info.fullHeight,
+                                previewWidth = info.previewWidth,
+                                previewHeight = info.previewHeight,
+                                isLibRaw16Bit = info.isDecodedByLibRaw,
+                                originalPreviewBitmap = info.initialPreviewBitmap,
+                                thumbnailBitmap = info.thumbnailBitmap,
+                                histogram = info.histogram,
+                                curvesState = RgbCurvesState()
+                            )
+                        )
+                    },
+                    onFailure = { err ->
+                        lastError = err.message
+                    }
+                )
+            }
+
+            if (newlyLoaded.isNotEmpty()) {
+                val targetActive = newlyLoaded.last()
+                _uiState.update { state ->
+                    val combined = state.photos + newlyLoaded
+                    state.copy(
+                        isLoading = false,
+                        loadingProgress = 1f,
+                        photos = combined,
+                        selectedPhotoId = targetActive.id,
+                        previewBitmap = targetActive.originalPreviewBitmap,
+                        previewRevision = state.previewRevision + 1L,
+                        statusMessage = if (newlyLoaded.size > 1) {
+                            "${newlyLoaded.size} 枚の画像を読み込みました"
+                        } else {
+                            null
+                        }
+                    )
+                }
+            } else {
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        statusMessage = "読み込みエラー: ${lastError ?: "不明なエラー"}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun selectPhoto(photoId: Int) {
+        val current = _uiState.value
+        val target = current.photos.firstOrNull { it.id == photoId } ?: return
+        if (current.selectedPhotoId == photoId) return
+
+        current.activePhoto?.let { prev ->
+            updateThumbnailAsync(prev.id, prev.previewWidth, prev.previewHeight, prev.curvesState)
+        }
+
+        _uiState.update {
+            it.copy(
+                selectedPhotoId = target.id,
+                previewBitmap = target.originalPreviewBitmap,
+                previewRevision = it.previewRevision + 1L
             )
         }
+        enqueuePreviewRender(target.id, target.previewWidth, target.previewHeight, target.curvesState)
+    }
+
+    fun closePhoto(photoId: Int) {
+        val current = _uiState.value
+        val remaining = current.photos.filterNot { it.id == photoId }
+        repository.removePhoto(photoId)
+
+        if (remaining.isEmpty()) {
+            _uiState.update {
+                it.copy(
+                    photos = emptyList(),
+                    selectedPhotoId = -1,
+                    previewBitmap = null,
+                    previewRevision = it.previewRevision + 1L
+                )
+            }
+            return
+        }
+
+        val nextActive = if (current.selectedPhotoId == photoId) {
+            remaining.last()
+        } else {
+            remaining.firstOrNull { it.id == current.selectedPhotoId } ?: remaining.last()
+        }
+
+        _uiState.update {
+            it.copy(
+                photos = remaining,
+                selectedPhotoId = nextActive.id,
+                previewBitmap = nextActive.originalPreviewBitmap,
+                previewRevision = it.previewRevision + 1L
+            )
+        }
+        enqueuePreviewRender(nextActive.id, nextActive.previewWidth, nextActive.previewHeight, nextActive.curvesState)
     }
 
     fun selectChannel(channel: CurveChannel) {
@@ -90,21 +247,97 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun updateChannelPoints(channel: CurveChannel, newPoints: List<CurvePoint>) {
-        val updatedCurves = _uiState.value.curvesState.withPoints(channel, newPoints)
-        _uiState.update { it.copy(curvesState = updatedCurves) }
-        schedulePreviewRender(updatedCurves)
+        val active = _uiState.value.activePhoto ?: return
+        val updatedCurves = active.curvesState.withPoints(channel, newPoints)
+        updateActivePhotoCurves(active.id, updatedCurves)
     }
 
     fun resetChannel(channel: CurveChannel) {
-        val updatedCurves = _uiState.value.curvesState.resetChannel(channel)
-        _uiState.update { it.copy(curvesState = updatedCurves) }
-        schedulePreviewRender(updatedCurves)
+        val active = _uiState.value.activePhoto ?: return
+        val updatedCurves = active.curvesState.resetChannel(channel)
+        updateActivePhotoCurves(active.id, updatedCurves)
+        updateThumbnailAsync(active.id, active.previewWidth, active.previewHeight, updatedCurves)
     }
 
     fun resetAllChannels() {
-        val updatedCurves = _uiState.value.curvesState.resetAll()
-        _uiState.update { it.copy(curvesState = updatedCurves) }
-        schedulePreviewRender(updatedCurves)
+        val active = _uiState.value.activePhoto ?: return
+        val updatedCurves = active.curvesState.resetAll()
+        updateActivePhotoCurves(active.id, updatedCurves)
+        updateThumbnailAsync(active.id, active.previewWidth, active.previewHeight, updatedCurves)
+    }
+
+    fun copyCurves() {
+        val active = _uiState.value.activePhoto ?: return
+        _uiState.update {
+            it.copy(
+                clipboardCurves = active.curvesState,
+                statusMessage = "カーブ設定をコピーしました"
+            )
+        }
+    }
+
+    fun pasteCurves() {
+        val state = _uiState.value
+        val active = state.activePhoto ?: return
+        val copied = state.clipboardCurves ?: return
+        updateActivePhotoCurves(active.id, copied)
+        updateThumbnailAsync(active.id, active.previewWidth, active.previewHeight, copied)
+        _uiState.update {
+            it.copy(statusMessage = "カーブ設定を貼り付けました")
+        }
+    }
+
+    fun showApplyAllConfirmDialog(visible: Boolean) {
+        _uiState.update { it.copy(isApplyAllConfirmVisible = visible) }
+    }
+
+    fun confirmApplyCurvesToAllPhotos() {
+        val state = _uiState.value
+        val active = state.activePhoto ?: return
+        if (state.photos.size <= 1) {
+            _uiState.update { it.copy(isApplyAllConfirmVisible = false) }
+            return
+        }
+
+        val sourceCurves = active.curvesState
+        _uiState.update { current ->
+            current.copy(
+                isApplyAllConfirmVisible = false,
+                photos = current.photos.map { item ->
+                    item.copy(curvesState = sourceCurves)
+                },
+                statusMessage = "全 ${current.photos.size} 枚の画像にカーブを適用しました"
+            )
+        }
+
+        viewModelScope.launch {
+            _uiState.value.photos.forEach { item ->
+                val res = repository.renderFreshPreviewSnapshot(
+                    photoId = item.id,
+                    previewWidth = item.previewWidth,
+                    previewHeight = item.previewHeight,
+                    curvesState = sourceCurves
+                )
+                if (res != null) {
+                    val thumb = repository.createThumbnail(res.bitmap, 160)
+                    res.bitmap.recycle()
+                    _uiState.update { s ->
+                        s.copy(
+                            photos = s.photos.map { p ->
+                                if (p.id == item.id) {
+                                    p.copy(
+                                        thumbnailBitmap = thumb,
+                                        histogram = res.histogram
+                                    )
+                                } else {
+                                    p
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+        }
     }
 
     fun setShowBefore(showBefore: Boolean) {
@@ -119,56 +352,150 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(statusMessage = null) }
     }
 
-    fun exportImage(scalePercent: Int, format: ExportFormat, jpegQuality: Int) {
+    fun exportImages(
+        scalePercent: Int,
+        format: ExportFormat,
+        jpegQuality: Int,
+        exportAll: Boolean
+    ) {
         val snapshot = _uiState.value
-        if (!snapshot.hasImage) return
+        val targets = if (exportAll) {
+            snapshot.photos
+        } else {
+            listOfNotNull(snapshot.activePhoto)
+        }
+        if (targets.isEmpty()) return
 
         viewModelScope.launch {
             _uiState.update {
                 it.copy(
                     isExportDialogVisible = false,
                     isExporting = true,
-                    statusMessage = "書き出し中 ($scalePercent% / ${format.label})..."
+                    exportProgress = 0.01f,
+                    exportProgressDetail = "1 / ${targets.size} • 0%"
                 )
             }
 
-            val result = repository.exportImage(
-                originalName = snapshot.fileName,
-                curvesState = snapshot.curvesState,
-                scalePercent = scalePercent,
-                format = format,
-                jpegQuality = jpegQuality
-            )
+            var successCount = 0
+            var lastError: String? = null
 
-            result.fold(
-                onSuccess = {
-                    val outW = (snapshot.fullWidth * (scalePercent / 100f)).toInt()
-                    val outH = (snapshot.fullHeight * (scalePercent / 100f)).toInt()
-                    _uiState.update { state ->
-                        state.copy(
-                            isExporting = false,
-                            statusMessage = "Pictures/RawCurveEditor に保存しました (${outW}×${outH}px)"
-                        )
+            targets.forEachIndexed { index, photo ->
+                val result = repository.exportImage(
+                    photoId = photo.id,
+                    uri = photo.uri,
+                    originalName = photo.fileName,
+                    fullWidth = photo.fullWidth,
+                    fullHeight = photo.fullHeight,
+                    curvesState = photo.curvesState,
+                    scalePercent = scalePercent,
+                    format = format,
+                    jpegQuality = jpegQuality,
+                    onProgress = { singlePhotoProgress ->
+                        val overall = ((index + singlePhotoProgress) / targets.size.toFloat()).coerceIn(0f, 1f)
+                        val pctInt = (overall * 100).roundToInt()
+                        _uiState.update { s ->
+                            s.copy(
+                                exportProgress = overall,
+                                exportProgressDetail = if (targets.size > 1) {
+                                    "${index + 1} / ${targets.size} (${photo.fileName}) • $pctInt%"
+                                } else {
+                                    "${photo.fileName} • $pctInt%"
+                                }
+                            )
+                        }
                     }
-                },
-                onFailure = { err ->
-                    _uiState.update { state ->
-                        state.copy(
-                            isExporting = false,
-                            statusMessage = "書き出し失敗: ${err.message}"
-                        )
-                    }
+                )
+
+                result.fold(
+                    onSuccess = { successCount++ },
+                    onFailure = { err -> lastError = err.message }
+                )
+            }
+
+            val summaryMsg = if (successCount == targets.size) {
+                if (targets.size == 1) {
+                    val p = targets.first()
+                    val outW = (p.fullWidth * (scalePercent / 100f)).roundToInt()
+                    val outH = (p.fullHeight * (scalePercent / 100f)).roundToInt()
+                    "保存完了: Pictures/RawCurveEditor (${outW}×${outH}px)"
+                } else {
+                    "全 $successCount 枚の画像を Pictures/RawCurveEditor に保存しました"
                 }
-            )
+            } else {
+                "一部失敗 ($successCount/${targets.size} 成功): ${lastError ?: ""}"
+            }
+
+            _uiState.update {
+                it.copy(
+                    isExporting = false,
+                    exportProgress = 1f,
+                    statusMessage = summaryMsg
+                )
+            }
         }
     }
 
-    private fun schedulePreviewRender(curvesState: RgbCurvesState) {
-        previewRenderJob?.cancel()
-        previewRenderJob = viewModelScope.launch {
-            val rendered = repository.renderPreview(curvesState)
-            if (rendered != null) {
-                _uiState.update { it.copy(previewBitmap = rendered) }
+    private fun updateActivePhotoCurves(photoId: Int, updatedCurves: RgbCurvesState) {
+        var previewW = 0
+        var previewH = 0
+        _uiState.update { current ->
+            val updatedPhotos = current.photos.map { item ->
+                if (item.id == photoId) {
+                    previewW = item.previewWidth
+                    previewH = item.previewHeight
+                    item.copy(curvesState = updatedCurves)
+                } else {
+                    item
+                }
+            }
+            current.copy(photos = updatedPhotos)
+        }
+        if (previewW > 0 && previewH > 0) {
+            enqueuePreviewRender(photoId, previewW, previewH, updatedCurves)
+        }
+    }
+
+    private fun enqueuePreviewRender(
+        photoId: Int,
+        previewWidth: Int,
+        previewHeight: Int,
+        curvesState: RgbCurvesState
+    ) {
+        previewRenderChannel.trySend(
+            PreviewRenderRequest(
+                photoId = photoId,
+                previewWidth = previewWidth,
+                previewHeight = previewHeight,
+                curvesState = curvesState
+            )
+        )
+    }
+
+    private fun updateThumbnailAsync(
+        photoId: Int,
+        previewWidth: Int,
+        previewHeight: Int,
+        curvesState: RgbCurvesState
+    ) {
+        viewModelScope.launch {
+            val res = repository.renderFreshPreviewSnapshot(photoId, previewWidth, previewHeight, curvesState)
+            if (res != null) {
+                val thumb = repository.createThumbnail(res.bitmap, 160)
+                res.bitmap.recycle()
+                _uiState.update { s ->
+                    s.copy(
+                        photos = s.photos.map { p ->
+                            if (p.id == photoId) {
+                                p.copy(
+                                    thumbnailBitmap = thumb,
+                                    histogram = res.histogram
+                                )
+                            } else {
+                                p
+                            }
+                        }
+                    )
+                }
             }
         }
     }

@@ -16,12 +16,19 @@ import com.example.rawcurveeditor.domain.ExportFormat
 import com.example.rawcurveeditor.domain.HistogramData
 import com.example.rawcurveeditor.domain.RgbCurvesState
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.max
 import kotlin.math.roundToInt
 
 data class LoadedRawImageInfo(
+    val photoId: Int,
+    val uri: Uri,
     val displayName: String,
     val fullWidth: Int,
     val fullHeight: Int,
@@ -29,19 +36,38 @@ data class LoadedRawImageInfo(
     val previewHeight: Int,
     val isDecodedByLibRaw: Boolean,
     val initialPreviewBitmap: Bitmap,
+    val thumbnailBitmap: Bitmap,
+    val histogram: HistogramData
+)
+
+data class PreviewRenderResult(
+    val bitmap: Bitmap,
     val histogram: HistogramData
 )
 
 class RawImageRepository(private val context: Context) {
 
-    private var previewWidth: Int = 0
-    private var previewHeight: Int = 0
-    private var fullWidth: Int = 0
-    private var fullHeight: Int = 0
+    private class DoubleBitmapBuffer(width: Int, height: Int) {
+        val buffers = arrayOf(
+            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888),
+            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        )
+        val histBuffer = IntArray(1024)
+        var index = 0
+
+        @Synchronized
+        fun next(): Bitmap {
+            index = (index + 1) and 1
+            return buffers[index]
+        }
+    }
+
+    private val doubleBuffers = ConcurrentHashMap<Int, DoubleBitmapBuffer>()
 
     suspend fun loadFromUri(
+        photoId: Int,
         uri: Uri,
-        maxPreviewDimension: Int = 1600
+        maxPreviewDimension: Int = 1280
     ): Result<LoadedRawImageInfo> = withContext(Dispatchers.IO) {
         runCatching {
             val fileName = queryDisplayName(uri) ?: "RAW_Image.ARW"
@@ -52,97 +78,198 @@ class RawImageRepository(private val context: Context) {
             var dims: IntArray? = null
 
             if (NativeRawBridge.isNativeLoaded) {
-                dims = NativeRawBridge.decodeRawBytesNative(bytes, maxPreviewDimension)
+                dims = NativeRawBridge.decodeRawBytesNative(photoId, bytes, maxPreviewDimension)
                 if (dims != null && dims.size == 4 && dims[0] > 0 && dims[1] > 0) {
                     decodedByLibRaw = true
                 }
             }
 
             if (dims == null) {
-                // Fallback for standard images or if LibRaw couldn't parse a specific container
                 val fallbackBitmap = decodeFallbackBitmap(bytes)
                     ?: error("未対応のRAWまたは画像形式です ($fileName)")
-                dims = NativeRawBridge.loadBitmapToNative(fallbackBitmap, maxPreviewDimension)
+                dims = NativeRawBridge.loadBitmapToNative(photoId, fallbackBitmap, maxPreviewDimension)
                     ?: error("ネイティブバッファへの展開に失敗しました")
                 fallbackBitmap.recycle()
             }
 
-            fullWidth = dims[0]
-            fullHeight = dims[1]
-            previewWidth = dims[2]
-            previewHeight = dims[3]
+            val fullW = dims[0]
+            val fullH = dims[1]
+            val prevW = dims[2]
+            val prevH = dims[3]
 
-            val previewBitmap = Bitmap.createBitmap(
-                previewWidth,
-                previewHeight,
-                Bitmap.Config.ARGB_8888
+            val initialPreview = Bitmap.createBitmap(prevW, prevH, Bitmap.Config.ARGB_8888)
+            val rawHist = IntArray(1024)
+            val linearTables = CurveSplineEngine.buildCurveTables1024(RgbCurvesState())
+            NativeRawBridge.renderPreviewFastNative(
+                photoId,
+                linearTables.master,
+                linearTables.red,
+                linearTables.green,
+                linearTables.blue,
+                initialPreview,
+                rawHist
             )
 
-            val linearLut = CurveSplineEngine.buildCombinedLut16(RgbCurvesState())
-            NativeRawBridge.renderPreviewWithLutNative(
-                linearLut.rLut,
-                linearLut.gLut,
-                linearLut.bLut,
-                previewBitmap
-            )
-
-            val histogram = computeHistogram()
+            doubleBuffers[photoId] = DoubleBitmapBuffer(prevW, prevH)
+            val thumbnail = createThumbnail(initialPreview, 160)
+            val histogram = parseHistogram(rawHist)
 
             LoadedRawImageInfo(
+                photoId = photoId,
+                uri = uri,
                 displayName = fileName,
-                fullWidth = fullWidth,
-                fullHeight = fullHeight,
-                previewWidth = previewWidth,
-                previewHeight = previewHeight,
+                fullWidth = fullW,
+                fullHeight = fullH,
+                previewWidth = prevW,
+                previewHeight = prevH,
                 isDecodedByLibRaw = decodedByLibRaw,
-                initialPreviewBitmap = previewBitmap,
+                initialPreviewBitmap = initialPreview,
+                thumbnailBitmap = thumbnail,
                 histogram = histogram
             )
         }
     }
 
-    suspend fun renderPreview(curvesState: RgbCurvesState): Bitmap? = withContext(Dispatchers.Default) {
+    suspend fun renderPreview(
+        photoId: Int,
+        previewWidth: Int,
+        previewHeight: Int,
+        curvesState: RgbCurvesState
+    ): PreviewRenderResult? = withContext(Dispatchers.Default) {
         if (previewWidth <= 0 || previewHeight <= 0 || !NativeRawBridge.isNativeLoaded) {
             return@withContext null
         }
-        val lut = CurveSplineEngine.buildCombinedLut16(curvesState)
-        val outBitmap = Bitmap.createBitmap(previewWidth, previewHeight, Bitmap.Config.ARGB_8888)
-        val ok = NativeRawBridge.renderPreviewWithLutNative(
-            lut.rLut,
-            lut.gLut,
-            lut.bLut,
-            outBitmap
+        val tables = CurveSplineEngine.buildCurveTables1024(curvesState)
+        val dbl = doubleBuffers.getOrPut(photoId) {
+            DoubleBitmapBuffer(previewWidth, previewHeight)
+        }
+        val targetBitmap = dbl.next()
+        val rawHist = dbl.histBuffer
+        val ok = NativeRawBridge.renderPreviewFastNative(
+            photoId,
+            tables.master,
+            tables.red,
+            tables.green,
+            tables.blue,
+            targetBitmap,
+            rawHist
         )
-        if (ok) outBitmap else null
+        if (ok) {
+            PreviewRenderResult(
+                bitmap = targetBitmap,
+                histogram = parseHistogram(rawHist)
+            )
+        } else {
+            null
+        }
+    }
+
+    suspend fun renderFreshPreviewSnapshot(
+        photoId: Int,
+        previewWidth: Int,
+        previewHeight: Int,
+        curvesState: RgbCurvesState
+    ): PreviewRenderResult? = withContext(Dispatchers.Default) {
+        if (previewWidth <= 0 || previewHeight <= 0 || !NativeRawBridge.isNativeLoaded) {
+            return@withContext null
+        }
+        val tables = CurveSplineEngine.buildCurveTables1024(curvesState)
+        val targetBitmap = Bitmap.createBitmap(previewWidth, previewHeight, Bitmap.Config.ARGB_8888)
+        val rawHist = IntArray(1024)
+        val ok = NativeRawBridge.renderPreviewFastNative(
+            photoId,
+            tables.master,
+            tables.red,
+            tables.green,
+            tables.blue,
+            targetBitmap,
+            rawHist
+        )
+        if (ok) {
+            PreviewRenderResult(
+                bitmap = targetBitmap,
+                histogram = parseHistogram(rawHist)
+            )
+        } else {
+            null
+        }
+    }
+
+    fun removePhoto(photoId: Int) {
+        doubleBuffers.remove(photoId)
+        if (NativeRawBridge.isNativeLoaded) {
+            NativeRawBridge.removePhotoNative(photoId)
+        }
     }
 
     suspend fun exportImage(
+        photoId: Int,
+        uri: Uri,
         originalName: String,
+        fullWidth: Int,
+        fullHeight: Int,
         curvesState: RgbCurvesState,
         scalePercent: Int,
         format: ExportFormat,
-        jpegQuality: Int
+        jpegQuality: Int,
+        onProgress: (Float) -> Unit
     ): Result<Uri> = withContext(Dispatchers.IO) {
         runCatching {
             require(fullWidth > 0 && fullHeight > 0) { "画像が読み込まれていません" }
+            onProgress(0.02f)
+
+            if (!NativeRawBridge.hasFullResLoadedNative(photoId)) {
+                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: error("元ファイルを読み込めませんでした")
+                var dims = NativeRawBridge.decodeRawBytesNative(photoId, bytes, 0)
+                if (dims == null) {
+                    val fallback = decodeFallbackBitmap(bytes)
+                        ?: error("画像の再展開に失敗しました")
+                    dims = NativeRawBridge.loadBitmapToNative(photoId, fallback, 0)
+                    fallback.recycle()
+                }
+                if (dims == null) error("ネイティブバッファの再展開に失敗しました")
+            }
+
+            onProgress(0.10f)
+
             val clampedPercent = scalePercent.coerceIn(5, 400)
             val scale = clampedPercent / 100.0f
             val targetW = max(1, (fullWidth * scale).roundToInt())
             val targetH = max(1, (fullHeight * scale).roundToInt())
 
-            val lut = CurveSplineEngine.buildCombinedLut16(curvesState)
+            val tables = CurveSplineEngine.buildCurveTables1024(curvesState)
             val exportBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
 
-            val rendered = NativeRawBridge.renderExportNative(
-                lut.rLut,
-                lut.gLut,
-                lut.bLut,
-                exportBitmap
-            )
+            val rendered = coroutineScope {
+                val pollJob = launch {
+                    while (isActive) {
+                        val nativePct = NativeRawBridge.getExportProgressNative().coerceIn(0, 90)
+                        val mapped = 0.10f + (nativePct / 90f) * 0.78f
+                        onProgress(mapped)
+                        delay(35)
+                    }
+                }
+                try {
+                    NativeRawBridge.renderExportFastNative(
+                        photoId,
+                        tables.master,
+                        tables.red,
+                        tables.green,
+                        tables.blue,
+                        exportBitmap
+                    )
+                } finally {
+                    pollJob.cancel()
+                }
+            }
+
             if (!rendered) {
                 exportBitmap.recycle()
                 error("書き出しレンダリングに失敗しました")
             }
+
+            onProgress(0.90f)
 
             val baseName = originalName.substringBeforeLast('.').ifBlank { "RAW_Edit" }
             val outputFileName = "${baseName}_${clampedPercent}pct_${targetW}x${targetH}.${format.extension}"
@@ -191,12 +318,21 @@ class RawImageRepository(private val context: Context) {
                 exportBitmap.recycle()
             }
 
+            onProgress(1.0f)
             itemUri
         }
     }
 
-    private fun computeHistogram(): HistogramData {
-        val raw = NativeRawBridge.computeHistogramNative() ?: return HistogramData()
+    fun createThumbnail(source: Bitmap, maxDim: Int = 160): Bitmap {
+        val w = source.width
+        val h = source.height
+        val scale = maxDim.toFloat() / maxOf(w, h, 1)
+        val tw = max(1, (w * scale).roundToInt())
+        val th = max(1, (h * scale).roundToInt())
+        return Bitmap.createScaledBitmap(source, tw, th, true)
+    }
+
+    private fun parseHistogram(raw: IntArray): HistogramData {
         if (raw.size < 256 * 4) return HistogramData()
 
         val r = raw.copyOfRange(0, 256)
@@ -204,10 +340,14 @@ class RawImageRepository(private val context: Context) {
         val b = raw.copyOfRange(512, 768)
         val luma = raw.copyOfRange(768, 1024)
 
-        // Exclude extreme clipping bins (0 and 255) when normalizing vertical scale so the curve graph looks balanced
         var maxVal = 1
         for (i in 2..253) {
             maxVal = maxOf(maxVal, r[i], g[i], b[i], luma[i])
+        }
+        if (maxVal <= 1) {
+            for (i in 0..255) {
+                maxVal = maxOf(maxVal, r[i], g[i], b[i], luma[i])
+            }
         }
         return HistogramData(r = r, g = g, b = b, luma = luma, maxCount = maxVal)
     }
@@ -218,7 +358,6 @@ class RawImageRepository(private val context: Context) {
         }
         var bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
         if (bmp == null) {
-            // Try embedded JPEG preview inside RAW via ExifInterface
             val exif = runCatching { ExifInterface(ByteArrayInputStream(bytes)) }.getOrNull()
             val thumbBytes = exif?.thumbnailBytes
             if (thumbBytes != null) {

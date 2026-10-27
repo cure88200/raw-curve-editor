@@ -15,23 +15,42 @@ object NativeRawBridge {
         }
     }
 
-    external fun decodeRawBytesNative(rawBytes: ByteArray, maxPreviewDimension: Int): IntArray?
+    external fun decodeRawBytesNative(
+        photoId: Int,
+        rawBytes: ByteArray,
+        maxPreviewDimension: Int
+    ): IntArray?
 
-    external fun loadBitmapToNative(bitmap: Bitmap, maxPreviewDimension: Int): IntArray?
+    external fun loadBitmapToNative(
+        photoId: Int,
+        bitmap: Bitmap,
+        maxPreviewDimension: Int
+    ): IntArray?
 
-    external fun computeHistogramNative(): IntArray?
+    external fun hasFullResLoadedNative(photoId: Int): Boolean
 
-    external fun renderPreviewWithLutNative(
-        lutR16: IntArray,
-        lutG16: IntArray,
-        lutB16: IntArray,
+    external fun removePhotoNative(photoId: Int)
+
+    external fun computeHistogramNative(photoId: Int): IntArray?
+
+    external fun renderPreviewFastNative(
+        photoId: Int,
+        masterTable1024: FloatArray,
+        redTable1024: FloatArray,
+        greenTable1024: FloatArray,
+        blueTable1024: FloatArray,
+        outBitmap: Bitmap,
+        outHistogram1024: IntArray?
+    ): Boolean
+
+    external fun renderExportFastNative(
+        photoId: Int,
+        masterTable1024: FloatArray,
+        redTable1024: FloatArray,
+        greenTable1024: FloatArray,
+        blueTable1024: FloatArray,
         outBitmap: Bitmap
     ): Boolean
 
-    external fun renderExportNative(
-        lutR16: IntArray,
-        lutG16: IntArray,
-        lutB16: IntArray,
-        outBitmap: Bitmap
-    ): Boolean
+    external fun getExportProgressNative(): Int
 }

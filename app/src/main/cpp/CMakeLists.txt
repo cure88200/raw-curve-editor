@@ -23,6 +23,7 @@ if(USE_LIBRAW)
 
     # Collect LibRaw source files directly to avoid autotools dependency on Android NDK
     file(GLOB LIBRAW_SOURCES
+        "${libraw_src_SOURCE_DIR}/src/*.cpp"
         "${libraw_src_SOURCE_DIR}/src/decoders/*.cpp"
         "${libraw_src_SOURCE_DIR}/src/decompressors/*.cpp"
         "${libraw_src_SOURCE_DIR}/src/demosaic/*.cpp"

@@ -51,16 +51,18 @@ import kotlin.math.roundToInt
 fun ExportDialog(
     originalWidth: Int,
     originalHeight: Int,
+    totalPhotoCount: Int,
     initialScalePercent: Int = 100,
     initialFormat: ExportFormat = ExportFormat.JPEG,
     initialJpegQuality: Int = 95,
     onDismiss: () -> Unit,
-    onConfirmExport: (scalePercent: Int, format: ExportFormat, jpegQuality: Int) -> Unit
+    onConfirmExport: (scalePercent: Int, format: ExportFormat, jpegQuality: Int, exportAll: Boolean) -> Unit
 ) {
     var scalePercent by remember { mutableIntStateOf(initialScalePercent.coerceIn(10, 300)) }
     var percentText by remember { mutableStateOf(scalePercent.toString()) }
     var format by remember { mutableStateOf(initialFormat) }
     var jpegQuality by remember { mutableIntStateOf(initialJpegQuality.coerceIn(1, 100)) }
+    var exportAll by remember { mutableStateOf(false) }
 
     val targetWidth = max(1, (originalWidth * (scalePercent / 100f)).roundToInt())
     val targetHeight = max(1, (originalHeight * (scalePercent / 100f)).roundToInt())
@@ -87,7 +89,53 @@ fun ExportDialog(
                     fontWeight = FontWeight.Bold
                 )
 
-                Spacer(modifier = Modifier.height(16.dp))
+                // Target selector when multiple photos are loaded
+                if (totalPhotoCount > 1) {
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Text(
+                        text = "TARGET",
+                        color = MonoTextSecondary,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        val options = listOf(
+                            false to "CURRENT (1)",
+                            true to "ALL PHOTOS ($totalPhotoCount)"
+                        )
+                        options.forEach { (isAll, label) ->
+                            val selected = exportAll == isAll
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(if (selected) MonoTextPrimary else MonoBackground)
+                                    .border(
+                                        1.dp,
+                                        if (selected) MonoTextPrimary else MonoBorder,
+                                        RoundedCornerShape(4.dp)
+                                    )
+                                    .clickable { exportAll = isAll }
+                                    .padding(vertical = 9.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = label,
+                                    color = if (selected) MonoBackground else MonoTextPrimary,
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
 
                 // Format selector (JPEG / PNG)
                 Text(
@@ -129,7 +177,6 @@ fun ExportDialog(
                     }
                 }
 
-                // JPEG Quality slider (only when JPEG is selected)
                 if (format == ExportFormat.JPEG) {
                     Spacer(modifier = Modifier.height(14.dp))
                     Row(
@@ -223,7 +270,6 @@ fun ExportDialog(
                     )
                 )
 
-                // Quick scale preset buttons including >100%
                 val presets = listOf(25, 50, 75, 100, 125, 150, 200)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -317,7 +363,6 @@ fun ExportDialog(
 
                 Spacer(modifier = Modifier.height(20.dp))
 
-                // Action Buttons
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.End
@@ -342,12 +387,12 @@ fun ExportDialog(
                             .clip(RoundedCornerShape(4.dp))
                             .background(MonoTextPrimary)
                             .clickable {
-                                onConfirmExport(scalePercent, format, jpegQuality)
+                                onConfirmExport(scalePercent, format, jpegQuality, exportAll)
                             }
                             .padding(horizontal = 20.dp, vertical = 10.dp)
                     ) {
                         Text(
-                            text = "EXPORT",
+                            text = if (exportAll && totalPhotoCount > 1) "EXPORT ALL ($totalPhotoCount)" else "EXPORT",
                             color = MonoBackground,
                             fontSize = 12.sp,
                             fontFamily = FontFamily.Monospace,

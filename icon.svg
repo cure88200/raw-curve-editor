@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000" width="1000" height="1000">
+  <!-- 背景（黒） -->
+  <rect width="1000" height="1000" fill="#000000" />
+
+  <!-- カーブ線（白） -->
+  <path d="M 30,960 A 930,930 0 0,0 960,30" fill="none" stroke="#ffffff" stroke-width="26" stroke-linecap="round" />
+
+  <!-- カーブ中央の丸い点 -->
+  <!-- 円弧の中心（45度地点）： x ≈ 688, y ≈ 688 -->
+  <circle cx="688" cy="688" r="40" fill="#ffffff" />
+</svg>
