@@ -21,6 +21,8 @@ import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.roundToInt
 
+private const val MAX_HISTORY_STEPS = 50
+
 @Immutable
 data class PhotoSessionItem(
     val id: Int,
@@ -34,8 +36,13 @@ data class PhotoSessionItem(
     val originalPreviewBitmap: Bitmap,
     val thumbnailBitmap: Bitmap,
     val histogram: HistogramData,
-    val curvesState: RgbCurvesState = RgbCurvesState()
-)
+    val curvesState: RgbCurvesState = RgbCurvesState(),
+    val undoStack: List<RgbCurvesState> = emptyList(),
+    val redoStack: List<RgbCurvesState> = emptyList()
+) {
+    val canUndo: Boolean get() = undoStack.isNotEmpty()
+    val canRedo: Boolean get() = redoStack.isNotEmpty()
+}
 
 data class EditorUiState(
     val isLoading: Boolean = false,
@@ -52,6 +59,8 @@ data class EditorUiState(
     val isShowingBefore: Boolean = false,
     val isExportDialogVisible: Boolean = false,
     val isApplyAllConfirmVisible: Boolean = false,
+    val isPasteConfirmVisible: Boolean = false,
+    val isExitConfirmVisible: Boolean = false,
     val statusMessage: String? = null
 ) {
     val activePhoto: PhotoSessionItem?
@@ -76,7 +85,6 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     private val _uiState = MutableStateFlow(EditorUiState())
     val uiState: StateFlow<EditorUiState> = _uiState.asStateFlow()
 
-    // Conflated channel guarantees zero backlog and continuous 60-120fps preview + real-time histogram rendering
     private val previewRenderChannel = Channel<PreviewRenderRequest>(Channel.CONFLATED)
 
     init {
@@ -119,7 +127,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 it.copy(
                     isLoading = true,
                     loadingProgress = 0f,
-                    statusMessage = "RAW (16-bit) 現像中 (0/${uris.size})..."
+                    statusMessage = "RAWデータ (16-bit) 展開中 (0/${uris.size})..."
                 )
             }
 
@@ -130,7 +138,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 _uiState.update {
                     it.copy(
                         loadingProgress = index.toFloat() / uris.size.coerceAtLeast(1),
-                        statusMessage = "RAW (16-bit) 現像中 (${index + 1}/${uris.size})..."
+                        statusMessage = "RAWデータ (16-bit) 展開中 (${index + 1}/${uris.size})..."
                     )
                 }
                 val assignedId = nextPhotoId.getAndIncrement()
@@ -246,24 +254,115 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(activeChannel = channel) }
     }
 
+    /**
+     * Called once at the beginning of a curve touch/drag gesture or point deletion
+     * to push the pre-gesture state onto the undo stack.
+     */
+    fun recordUndoSnapshot() {
+        val active = _uiState.value.activePhoto ?: return
+        _uiState.update { state ->
+            state.copy(
+                photos = state.photos.map { item ->
+                    if (item.id == active.id) {
+                        val newUndo = (item.undoStack + item.curvesState).takeLast(MAX_HISTORY_STEPS)
+                        item.copy(
+                            undoStack = newUndo,
+                            redoStack = emptyList()
+                        )
+                    } else {
+                        item
+                    }
+                }
+            )
+        }
+    }
+
+    fun onCurveGestureFinished() {
+        val active = _uiState.value.activePhoto ?: return
+        updateThumbnailAsync(active.id, active.previewWidth, active.previewHeight, active.curvesState)
+    }
+
     fun updateChannelPoints(channel: CurveChannel, newPoints: List<CurvePoint>) {
         val active = _uiState.value.activePhoto ?: return
         val updatedCurves = active.curvesState.withPoints(channel, newPoints)
-        updateActivePhotoCurves(active.id, updatedCurves)
+        updateActivePhotoCurves(active.id, updatedCurves, pushUndo = false)
+    }
+
+    fun deleteChannelPoint(channel: CurveChannel, newPoints: List<CurvePoint>) {
+        val active = _uiState.value.activePhoto ?: return
+        val updatedCurves = active.curvesState.withPoints(channel, newPoints)
+        updateActivePhotoCurves(active.id, updatedCurves, pushUndo = true)
+        updateThumbnailAsync(active.id, active.previewWidth, active.previewHeight, updatedCurves)
     }
 
     fun resetChannel(channel: CurveChannel) {
         val active = _uiState.value.activePhoto ?: return
         val updatedCurves = active.curvesState.resetChannel(channel)
-        updateActivePhotoCurves(active.id, updatedCurves)
+        if (updatedCurves == active.curvesState) return
+        updateActivePhotoCurves(active.id, updatedCurves, pushUndo = true)
         updateThumbnailAsync(active.id, active.previewWidth, active.previewHeight, updatedCurves)
     }
 
     fun resetAllChannels() {
         val active = _uiState.value.activePhoto ?: return
         val updatedCurves = active.curvesState.resetAll()
-        updateActivePhotoCurves(active.id, updatedCurves)
+        if (updatedCurves == active.curvesState) return
+        updateActivePhotoCurves(active.id, updatedCurves, pushUndo = true)
         updateThumbnailAsync(active.id, active.previewWidth, active.previewHeight, updatedCurves)
+    }
+
+    fun undo() {
+        val active = _uiState.value.activePhoto ?: return
+        if (active.undoStack.isEmpty()) return
+
+        val previousCurves = active.undoStack.last()
+        val remainingUndo = active.undoStack.dropLast(1)
+        val updatedRedo = (active.redoStack + active.curvesState).takeLast(MAX_HISTORY_STEPS)
+
+        _uiState.update { state ->
+            state.copy(
+                photos = state.photos.map { item ->
+                    if (item.id == active.id) {
+                        item.copy(
+                            curvesState = previousCurves,
+                            undoStack = remainingUndo,
+                            redoStack = updatedRedo
+                        )
+                    } else {
+                        item
+                    }
+                }
+            )
+        }
+        enqueuePreviewRender(active.id, active.previewWidth, active.previewHeight, previousCurves)
+        updateThumbnailAsync(active.id, active.previewWidth, active.previewHeight, previousCurves)
+    }
+
+    fun redo() {
+        val active = _uiState.value.activePhoto ?: return
+        if (active.redoStack.isEmpty()) return
+
+        val nextCurves = active.redoStack.last()
+        val remainingRedo = active.redoStack.dropLast(1)
+        val updatedUndo = (active.undoStack + active.curvesState).takeLast(MAX_HISTORY_STEPS)
+
+        _uiState.update { state ->
+            state.copy(
+                photos = state.photos.map { item ->
+                    if (item.id == active.id) {
+                        item.copy(
+                            curvesState = nextCurves,
+                            undoStack = updatedUndo,
+                            redoStack = remainingRedo
+                        )
+                    } else {
+                        item
+                    }
+                }
+            )
+        }
+        enqueuePreviewRender(active.id, active.previewWidth, active.previewHeight, nextCurves)
+        updateThumbnailAsync(active.id, active.previewWidth, active.previewHeight, nextCurves)
     }
 
     fun copyCurves() {
@@ -276,11 +375,30 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun pasteCurves() {
+    fun requestPasteCurves() {
         val state = _uiState.value
         val active = state.activePhoto ?: return
         val copied = state.clipboardCurves ?: return
-        updateActivePhotoCurves(active.id, copied)
+
+        // If the target image already has curve edits (and differs from clipboard), ask for confirmation
+        if (active.curvesState.isModified && active.curvesState != copied) {
+            _uiState.update { it.copy(isPasteConfirmVisible = true) }
+        } else {
+            confirmPasteCurves()
+        }
+    }
+
+    fun showPasteConfirmDialog(visible: Boolean) {
+        _uiState.update { it.copy(isPasteConfirmVisible = visible) }
+    }
+
+    fun confirmPasteCurves() {
+        val state = _uiState.value
+        val active = state.activePhoto ?: return
+        val copied = state.clipboardCurves ?: return
+
+        _uiState.update { it.copy(isPasteConfirmVisible = false) }
+        updateActivePhotoCurves(active.id, copied, pushUndo = true)
         updateThumbnailAsync(active.id, active.previewWidth, active.previewHeight, copied)
         _uiState.update {
             it.copy(statusMessage = "カーブ設定を貼り付けました")
@@ -304,7 +422,15 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             current.copy(
                 isApplyAllConfirmVisible = false,
                 photos = current.photos.map { item ->
-                    item.copy(curvesState = sourceCurves)
+                    if (item.curvesState == sourceCurves) {
+                        item
+                    } else {
+                        item.copy(
+                            curvesState = sourceCurves,
+                            undoStack = (item.undoStack + item.curvesState).takeLast(MAX_HISTORY_STEPS),
+                            redoStack = emptyList()
+                        )
+                    }
                 },
                 statusMessage = "全 ${current.photos.size} 枚の画像にカーブを適用しました"
             )
@@ -338,6 +464,10 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 }
             }
         }
+    }
+
+    fun showExitConfirmDialog(visible: Boolean) {
+        _uiState.update { it.copy(isExitConfirmVisible = visible) }
     }
 
     fun setShowBefore(showBefore: Boolean) {
@@ -435,7 +565,11 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private fun updateActivePhotoCurves(photoId: Int, updatedCurves: RgbCurvesState) {
+    private fun updateActivePhotoCurves(
+        photoId: Int,
+        updatedCurves: RgbCurvesState,
+        pushUndo: Boolean
+    ) {
         var previewW = 0
         var previewH = 0
         _uiState.update { current ->
@@ -443,7 +577,16 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 if (item.id == photoId) {
                     previewW = item.previewWidth
                     previewH = item.previewHeight
-                    item.copy(curvesState = updatedCurves)
+                    if (pushUndo && item.curvesState != updatedCurves) {
+                        val newUndo = (item.undoStack + item.curvesState).takeLast(MAX_HISTORY_STEPS)
+                        item.copy(
+                            curvesState = updatedCurves,
+                            undoStack = newUndo,
+                            redoStack = emptyList()
+                        )
+                    } else {
+                        item.copy(curvesState = updatedCurves)
+                    }
                 } else {
                     item
                 }

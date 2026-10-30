@@ -3,6 +3,7 @@ package com.example.rawcurveeditor
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -106,6 +107,11 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                // Intercept Back button to show confirmation dialog before closing the app
+                BackHandler(enabled = !state.isLoading && !state.isExporting) {
+                    viewModel.showExitConfirmDialog(true)
+                }
+
                 // Auto-dismiss status toast messages after 2.5 seconds
                 LaunchedEffect(state.statusMessage, state.isLoading, state.isExporting) {
                     if (!state.isLoading && !state.isExporting && state.statusMessage != null) {
@@ -122,11 +128,18 @@ class MainActivity : ComponentActivity() {
                     onSelectPhoto = viewModel::selectPhoto,
                     onClosePhoto = viewModel::closePhoto,
                     onSelectChannel = viewModel::selectChannel,
+                    onBeginCurveGesture = viewModel::recordUndoSnapshot,
+                    onEndCurveGesture = viewModel::onCurveGestureFinished,
                     onUpdateChannelPoints = viewModel::updateChannelPoints,
+                    onDeleteChannelPoint = viewModel::deleteChannelPoint,
                     onResetChannel = viewModel::resetChannel,
                     onResetAll = viewModel::resetAllChannels,
+                    onUndo = viewModel::undo,
+                    onRedo = viewModel::redo,
                     onCopyCurves = viewModel::copyCurves,
-                    onPasteCurves = viewModel::pasteCurves,
+                    onRequestPasteCurves = viewModel::requestPasteCurves,
+                    onDismissPasteConfirm = { viewModel.showPasteConfirmDialog(false) },
+                    onConfirmPasteCurves = viewModel::confirmPasteCurves,
                     onRequestApplyToAllPhotos = { viewModel.showApplyAllConfirmDialog(true) },
                     onDismissApplyAllConfirm = { viewModel.showApplyAllConfirmDialog(false) },
                     onConfirmApplyToAllPhotos = viewModel::confirmApplyCurvesToAllPhotos,
@@ -134,6 +147,8 @@ class MainActivity : ComponentActivity() {
                     onOpenExportDialog = { viewModel.showExportDialog(true) },
                     onDismissExportDialog = { viewModel.showExportDialog(false) },
                     onConfirmExport = viewModel::exportImages,
+                    onDismissExitConfirm = { viewModel.showExitConfirmDialog(false) },
+                    onConfirmExitApp = { finish() },
                     onDismissStatus = viewModel::clearStatusMessage
                 )
             }
@@ -148,11 +163,18 @@ private fun RawCurveEditorScreen(
     onSelectPhoto: (Int) -> Unit,
     onClosePhoto: (Int) -> Unit,
     onSelectChannel: (CurveChannel) -> Unit,
+    onBeginCurveGesture: () -> Unit,
+    onEndCurveGesture: () -> Unit,
     onUpdateChannelPoints: (CurveChannel, List<CurvePoint>) -> Unit,
+    onDeleteChannelPoint: (CurveChannel, List<CurvePoint>) -> Unit,
     onResetChannel: (CurveChannel) -> Unit,
     onResetAll: () -> Unit,
+    onUndo: () -> Unit,
+    onRedo: () -> Unit,
     onCopyCurves: () -> Unit,
-    onPasteCurves: () -> Unit,
+    onRequestPasteCurves: () -> Unit,
+    onDismissPasteConfirm: () -> Unit,
+    onConfirmPasteCurves: () -> Unit,
     onRequestApplyToAllPhotos: () -> Unit,
     onDismissApplyAllConfirm: () -> Unit,
     onConfirmApplyToAllPhotos: () -> Unit,
@@ -160,6 +182,8 @@ private fun RawCurveEditorScreen(
     onOpenExportDialog: () -> Unit,
     onDismissExportDialog: () -> Unit,
     onConfirmExport: (Int, ExportFormat, Int, Boolean) -> Unit,
+    onDismissExitConfirm: () -> Unit,
+    onConfirmExitApp: () -> Unit,
     onDismissStatus: () -> Unit
 ) {
     val activePhoto = state.activePhoto
@@ -220,7 +244,7 @@ private fun RawCurveEditorScreen(
             // Determinate Progress Overlay for Loading or Exporting
             if (state.isLoading || state.isExporting) {
                 ProgressModalOverlay(
-                    title = if (state.isExporting) "EXPORTING IMAGE" else "DEVELOPING RAW",
+                    title = if (state.isExporting) "EXPORTING IMAGE" else "LOADING RAW (16-BIT)",
                     detail = if (state.isExporting) {
                         state.exportProgressDetail
                     } else {
@@ -260,23 +284,52 @@ private fun RawCurveEditorScreen(
             curvesState = activePhoto?.curvesState ?: RgbCurvesState(),
             activeChannel = state.activeChannel,
             histogram = activePhoto?.histogram ?: HistogramData(),
+            canUndo = activePhoto?.canUndo == true,
+            canRedo = activePhoto?.canRedo == true,
             hasCopiedCurves = state.clipboardCurves != null,
             photoCount = state.photos.size,
             onSelectChannel = onSelectChannel,
+            onBeginCurveGesture = onBeginCurveGesture,
+            onEndCurveGesture = onEndCurveGesture,
             onUpdateChannelPoints = onUpdateChannelPoints,
+            onDeleteChannelPoint = onDeleteChannelPoint,
             onResetChannel = onResetChannel,
             onResetAll = onResetAll,
+            onUndo = onUndo,
+            onRedo = onRedo,
             onCopyCurves = onCopyCurves,
-            onPasteCurves = onPasteCurves,
+            onPasteCurves = onRequestPasteCurves,
             onRequestApplyToAllPhotos = onRequestApplyToAllPhotos
         )
     }
 
+    if (state.isPasteConfirmVisible) {
+        MonotoneConfirmDialog(
+            title = "OVERWRITE CURVES",
+            message = "この画像はすでに編集されています。ペーストして現在の変更内容を上書きしますか？",
+            confirmText = "PASTE",
+            onDismiss = onDismissPasteConfirm,
+            onConfirm = onConfirmPasteCurves
+        )
+    }
+
     if (state.isApplyAllConfirmVisible && state.photos.size > 1) {
-        ApplyAllConfirmDialog(
-            photoCount = state.photos.size,
+        MonotoneConfirmDialog(
+            title = "APPLY TO ALL PHOTOS",
+            message = "現在のカーブ設定を開いているすべての画像（全 ${state.photos.size} 枚）に適用しますか？",
+            confirmText = "APPLY ALL",
             onDismiss = onDismissApplyAllConfirm,
             onConfirm = onConfirmApplyToAllPhotos
+        )
+    }
+
+    if (state.isExitConfirmVisible) {
+        MonotoneConfirmDialog(
+            title = "EXIT APP",
+            message = "アプリを終了しますか？保存していない編集内容は失われます。",
+            confirmText = "EXIT",
+            onDismiss = onDismissExitConfirm,
+            onConfirm = onConfirmExitApp
         )
     }
 
@@ -292,8 +345,10 @@ private fun RawCurveEditorScreen(
 }
 
 @Composable
-private fun ApplyAllConfirmDialog(
-    photoCount: Int,
+private fun MonotoneConfirmDialog(
+    title: String,
+    message: String,
+    confirmText: String,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit
 ) {
@@ -311,7 +366,7 @@ private fun ApplyAllConfirmDialog(
                     .padding(20.dp)
             ) {
                 Text(
-                    text = "APPLY TO ALL PHOTOS",
+                    text = title,
                     color = MonoTextPrimary,
                     fontSize = 14.sp,
                     fontFamily = FontFamily.Monospace,
@@ -321,7 +376,7 @@ private fun ApplyAllConfirmDialog(
                 Spacer(modifier = Modifier.height(12.dp))
 
                 Text(
-                    text = "現在のカーブ設定を開いているすべての画像（全 ${photoCount} 枚）に適用しますか？",
+                    text = message,
                     color = MonoTextSecondary,
                     fontSize = 12.sp,
                     fontFamily = FontFamily.Monospace
@@ -356,7 +411,7 @@ private fun ApplyAllConfirmDialog(
                             .padding(horizontal = 20.dp, vertical = 10.dp)
                     ) {
                         Text(
-                            text = "APPLY ALL",
+                            text = confirmText,
                             color = MonoBackground,
                             fontSize = 12.sp,
                             fontFamily = FontFamily.Monospace,
@@ -736,7 +791,7 @@ private fun EmptyStatePrompt(onOpenFiles: () -> Unit) {
         )
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "SONY .ARW / .DNG / .CR2 / .NEF / .JPG / .PNG",
+            text = ".ARW / .DNG / .CR2 / .NEF / .JPG / .PNG",
             color = MonoTextSecondary,
             fontSize = 11.sp,
             fontFamily = FontFamily.Monospace

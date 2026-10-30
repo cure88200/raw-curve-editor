@@ -41,7 +41,6 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.rawcurveeditor.domain.CurveChannel
@@ -69,12 +68,19 @@ fun RgbCurveEditorPanel(
     curvesState: RgbCurvesState,
     activeChannel: CurveChannel,
     histogram: HistogramData,
+    canUndo: Boolean,
+    canRedo: Boolean,
     hasCopiedCurves: Boolean,
     photoCount: Int,
     onSelectChannel: (CurveChannel) -> Unit,
+    onBeginCurveGesture: () -> Unit,
+    onEndCurveGesture: () -> Unit,
     onUpdateChannelPoints: (CurveChannel, List<CurvePoint>) -> Unit,
+    onDeleteChannelPoint: (CurveChannel, List<CurvePoint>) -> Unit,
     onResetChannel: (CurveChannel) -> Unit,
     onResetAll: () -> Unit,
+    onUndo: () -> Unit,
+    onRedo: () -> Unit,
     onCopyCurves: () -> Unit,
     onPasteCurves: () -> Unit,
     onRequestApplyToAllPhotos: () -> Unit,
@@ -129,7 +135,7 @@ fun RgbCurveEditorPanel(
                         if (idx > 0 && idx < activePoints.lastIndex) {
                             val updated = activePoints.toMutableList().apply { removeAt(idx) }
                             selectedPointIndex = -1
-                            onUpdateChannelPoints(activeChannel, updated)
+                            onDeleteChannelPoint(activeChannel, updated)
                         }
                     }
                 )
@@ -171,6 +177,9 @@ fun RgbCurveEditorPanel(
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
                         down.consume()
+
+                        // Record Undo snapshot once at the start of the touch gesture
+                        onBeginCurveGesture()
 
                         val w = size.width.toFloat().coerceAtLeast(1f)
                         val h = size.height.toFloat().coerceAtLeast(1f)
@@ -244,6 +253,8 @@ fun RgbCurveEditorPanel(
                                 onUpdateChannelPoints(currentChannelState, workingPoints)
                             }
                         }
+
+                        onEndCurveGesture()
                     }
                 }
         ) {
@@ -278,11 +289,30 @@ fun RgbCurveEditorPanel(
                     activeColor = activeColor
                 )
             }
+
+            // Subtle coordinate HUD overlay in top-left of curve box
+            val selectedPt = activePoints.getOrNull(selectedPointIndex)
+            val hudText = if (selectedPt != null) {
+                val inVal = (selectedPt.x * 255).roundToInt()
+                val outVal = (selectedPt.y * 255).roundToInt()
+                "IN:$inVal → OUT:$outVal (${activePoints.size}pt)"
+            } else {
+                "${activeChannel.label} • ${activePoints.size}pt"
+            }
+            Text(
+                text = hudText,
+                color = MonoTextSecondary.copy(alpha = 0.8f),
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
+            )
         }
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Fixed-height footer row: Coordinates readout + Copy / Paste / Apply All
+        // Fixed-height footer row: UNDO / REDO on the left + COPY / PASTE / APPLY ALL on the right
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -290,24 +320,21 @@ fun RgbCurveEditorPanel(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            val selectedPt = activePoints.getOrNull(selectedPointIndex)
-            val coordText = if (selectedPt != null) {
-                val inVal = (selectedPt.x * 255).roundToInt()
-                val outVal = (selectedPt.y * 255).roundToInt()
-                "IN:$inVal → OUT:$outVal (${activePoints.size}pt)"
-            } else {
-                "TOUCH & DRAG TO ADJUST (${activePoints.size}pt)"
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                SmallMonoButton(
+                    text = "UNDO",
+                    enabled = canUndo,
+                    onClick = onUndo
+                )
+                SmallMonoButton(
+                    text = "REDO",
+                    enabled = canRedo,
+                    onClick = onRedo
+                )
             }
-
-            Text(
-                text = coordText,
-                color = MonoTextSecondary,
-                fontSize = 10.sp,
-                fontFamily = FontFamily.Monospace,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
-            )
 
             Row(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -315,12 +342,12 @@ fun RgbCurveEditorPanel(
             ) {
                 SmallMonoButton(
                     text = "COPY",
-                    enabled = true,
+                    enabled = activePhotoId != -1,
                     onClick = onCopyCurves
                 )
                 SmallMonoButton(
                     text = "PASTE",
-                    enabled = hasCopiedCurves,
+                    enabled = activePhotoId != -1 && hasCopiedCurves,
                     onClick = onPasteCurves
                 )
                 SmallMonoButton(
@@ -466,11 +493,6 @@ private fun DrawScope.drawRuleOfThirdsGrid() {
     )
 }
 
-/**
- * Draws all 4 histogram channels (RGB Master, R, G, B):
- * - Non-active channels are drawn faintly in the background.
- * - The currently active channel is drawn at standard visibility on top.
- */
 private fun DrawScope.drawHistogramBackdrop(
     histogram: HistogramData,
     activeChannel: CurveChannel
